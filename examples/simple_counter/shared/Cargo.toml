@@ -23,3 +23,6 @@ uniffi = { version = "0.28.2", features = ["cli"] }
 
 [build-dependencies]
 uniffi = { version = "0.28.2", features = ["build"] }
+
+[dev-dependencies]
+anyhow.workspace = true
