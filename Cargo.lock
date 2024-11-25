@@ -506,7 +506,6 @@ dependencies = [
  "ignore",
  "lazy-regex",
  "libc",
- "petgraph",
  "ramhorns",
  "rustdoc-json",
  "rustdoc-types",
