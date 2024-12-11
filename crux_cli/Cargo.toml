@@ -37,3 +37,4 @@ toml = "0.8.19"
 [dev-dependencies]
 insta = { version = "1.41.1" }
 pretty_assertions = "1.4.1"
+rstest = "0.23.0"
