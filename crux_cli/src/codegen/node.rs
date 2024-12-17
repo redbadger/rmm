@@ -1,16 +1,82 @@
-use std::hash::{Hash, Hasher};
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+};
 
 use rustdoc_types::{
-    ExternalCrate, GenericArg, GenericArgs, Id, Item, ItemEnum, ItemSummary, Path, Type,
+    ExternalCrate, GenericArg, GenericArgs, Id, Impl, Item, ItemEnum, ItemSummary, Module, Path,
+    Struct, StructKind, Type,
 };
 use serde::{Deserialize, Serialize};
 
 use super::item::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Edge {
+    ModuleItem,
+    ImplFor,
+    Impl,
+    StructField,
+    Type,
+}
+
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub enum Node {
+    Item(ItemNode),
+    Summary(SummaryNode),
+}
+
+impl Ord for Node {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Node::Item(_), Node::Item(_)) => Ordering::Equal,
+            (Node::Item(_), Node::Summary(_)) => Ordering::Greater,
+            (Node::Summary(_), Node::Item(_)) => Ordering::Less,
+            (Node::Summary(_), Node::Summary(_)) => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Hash for Node {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id().hash(state);
+    }
+}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl Node {
+    fn id(&self) -> &GlobalId {
+        match self {
+            Node::Item(i) => &i.id,
+            Node::Summary(s) => &s.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GlobalId {
     pub crate_: String,
     pub id: u32,
+}
+
+impl GlobalId {
+    pub fn new(crate_: &str, id: u32) -> Self {
+        Self {
+            crate_: crate_.to_string(),
+            id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
@@ -69,6 +135,10 @@ impl SummaryNode {
         }
     }
 
+    pub fn path(&self) -> Vec<String> {
+        self.summary.path.clone()
+    }
+
     pub fn in_same_module_as(&self, other: &SummaryNode) -> bool {
         let this = &self.summary.path;
         let other = &other.summary.path;
@@ -114,6 +184,90 @@ impl ItemNode {
         }
     }
 
+    pub fn edges(&self) -> Vec<(GlobalId, Edge)> {
+        let crate_ = &self.id.crate_;
+        match &self.item.inner {
+            ItemEnum::Module(Module { items, .. }) => items
+                .iter()
+                .map(|id| (GlobalId::new(crate_, id.0), Edge::ModuleItem))
+                .collect(),
+            ItemEnum::ExternCrate { name: _, rename: _ } => vec![],
+            ItemEnum::Use(_) => vec![],
+            ItemEnum::Union(_union) => vec![],
+            ItemEnum::Struct(Struct {
+                kind,
+                generics: _,
+                impls,
+            }) => {
+                let mut edges = vec![];
+                match kind {
+                    StructKind::Plain { fields, .. } => {
+                        edges.extend(
+                            fields
+                                .iter()
+                                .map(|id| (GlobalId::new(crate_, id.0), Edge::StructField)),
+                        );
+                    }
+                    StructKind::Tuple(fields) => {
+                        edges.extend(
+                            fields
+                                .iter()
+                                .filter_map(|f| f.as_ref())
+                                .map(|id| (GlobalId::new(crate_, id.0), Edge::StructField)),
+                        );
+                    }
+                    StructKind::Unit => {}
+                }
+                edges.extend(
+                    impls
+                        .iter()
+                        .map(|id| (GlobalId::new(crate_, id.0), Edge::Impl)),
+                );
+                edges
+            }
+            ItemEnum::StructField(type_) => match type_ {
+                Type::ResolvedPath(Path { id, .. }) => {
+                    vec![(GlobalId::new(crate_, id.0), Edge::Type)]
+                }
+                _ => vec![],
+            },
+            ItemEnum::Enum(_) => vec![],
+            ItemEnum::Variant(_variant) => vec![],
+            ItemEnum::Function(_function) => vec![],
+            ItemEnum::Trait(_) => vec![],
+            ItemEnum::TraitAlias(_trait_alias) => vec![],
+            ItemEnum::Impl(Impl {
+                trait_: Some(Path { name, .. }),
+                for_,
+                ..
+            }) if (&["App", "Effect", "Capability", "Operation"]).contains(&name.as_str()) => {
+                match for_ {
+                    Type::ResolvedPath(Path { id, .. }) => {
+                        vec![(GlobalId::new(crate_, id.0), Edge::ImplFor)]
+                    }
+                    _ => vec![],
+                }
+            }
+            ItemEnum::TypeAlias(_type_alias) => vec![],
+            ItemEnum::Constant {
+                type_: _,
+                const_: _,
+            } => vec![],
+            ItemEnum::Static(_) => vec![],
+            ItemEnum::ExternType => vec![],
+            ItemEnum::Macro(_) => vec![],
+            ItemEnum::ProcMacro(_proc_macro) => vec![],
+            ItemEnum::Primitive(_primitive) => vec![],
+            ItemEnum::AssocConst { type_: _, value: _ } => vec![],
+            ItemEnum::AssocType {
+                generics: _,
+                bounds: _,
+                type_: _,
+            } => vec![],
+            _ => vec![],
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         let mut new_name = "";
         for attr in &self.item.attrs {
@@ -135,11 +289,7 @@ impl ItemNode {
     }
 
     pub fn is_impl_for(&self, for_: &ItemNode, trait_name: &str) -> bool {
-        if self.id.crate_ != for_.id.crate_ {
-            return false;
-        }
-
-        is_impl_for(&self.item, &for_.item, trait_name)
+        self.id.crate_ == for_.id.crate_ && is_impl_for(&self.item, &for_.item, trait_name)
     }
 
     pub fn is_range(&self) -> bool {
@@ -175,14 +325,9 @@ impl ItemNode {
     }
 
     pub fn has_field(&self, field: &ItemNode) -> bool {
-        if self.id.crate_ != field.id.crate_ || field.should_skip() {
-            return false;
-        }
-        if field.name() == Some("__private_field") {
-            return false;
-        }
-
-        has_field(&self.item, &field.item)
+        self.id.crate_ == field.id.crate_
+            && !field.should_skip()
+            && has_field(&self.item, &field.item)
     }
 
     pub fn variants(&self, variants: Vec<(&ItemNode,)>) -> Vec<ItemNode> {
@@ -201,11 +346,9 @@ impl ItemNode {
     }
 
     pub fn has_variant(&self, variant: &ItemNode) -> bool {
-        if self.id.crate_ != variant.id.crate_ || variant.should_skip() {
-            return false;
-        }
-
-        has_variant(&self.item, &variant.item)
+        self.id.crate_ == variant.id.crate_
+            && !variant.should_skip()
+            && has_variant(&self.item, &variant.item)
     }
 
     pub fn is_of_local_type(&self, type_node: &ItemNode) -> bool {
@@ -217,33 +360,27 @@ impl ItemNode {
     }
 
     fn is_of_type(&self, id: &GlobalId, is_remote: bool) -> bool {
-        if self.id.crate_ != id.crate_ {
-            return false;
-        }
-
-        match &self.item {
-            Item {
-                inner: ItemEnum::StructField(t),
-                ..
-            } => check_type(&id, t, is_remote),
-            Item {
-                inner:
-                    ItemEnum::AssocType {
-                        type_: Some(Type::ResolvedPath(target)),
-                        ..
-                    },
-                ..
-            } => target.id.0 == id.id,
-            _ => false,
-        }
+        self.id.crate_ == id.crate_
+            && match &self.item {
+                Item {
+                    inner: ItemEnum::StructField(t),
+                    ..
+                } => check_type(&id, t, is_remote),
+                Item {
+                    inner:
+                        ItemEnum::AssocType {
+                            type_: Some(Type::ResolvedPath(target)),
+                            ..
+                        },
+                    ..
+                } => target.id.0 == id.id,
+                _ => false,
+            }
     }
 
     pub fn has_associated_item(&self, associated_item: &ItemNode, with_name: &str) -> bool {
-        if self.id.crate_ != associated_item.id.crate_ {
-            return false;
-        }
-
-        has_associated_item(&self.item, &associated_item.item, with_name)
+        self.id.crate_ == associated_item.id.crate_
+            && has_associated_item(&self.item, &associated_item.item, with_name)
     }
 }
 
